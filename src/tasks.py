@@ -1,33 +1,23 @@
+import json
+import os
 import subprocess
+import tempfile
+from pathlib import Path
 
 from celery import signals
 from celery.utils.log import get_task_logger
-
-# API docs - https://openrelik.github.io/openrelik-worker-common/openrelik_worker_common/index.html
 from openrelik_worker_common.file_utils import create_output_file
 from openrelik_common.logging import Logger
 from openrelik_worker_common.task_utils import create_task_result, get_input_files
 
 from .app import celery
 
-# Task name used to register and route the task to the correct queue.
-TASK_NAME = "openrelik-worker-ewf-validator.tasks.your_task_name"
+TASK_NAME = "openrelik-worker-ewf-validator.tasks.validate_ewf"
 
-# Task metadata for registration in the core system.
 TASK_METADATA = {
-    "display_name": "openrelik-worker-ewf-validator",
-    "description": "Validates EWF forensic image sets for completeness, integrity, and processing readiness using libewf tools.",
-    # Configuration that will be rendered as a web for in the UI, and any data entered
-    # by the user will be available to the task function when executing (task_config).
-    "task_config": [
-        {
-            "name": "<REPLACE_WITH_NAME>",
-            "label": "<REPLACE_WITH_LABEL>",
-            "description": "<REPLACE_WITH_DESCRIPTION>",
-            "type": "<REPLACE_WITH_TYPE>",  # Types supported: text, textarea, checkbox
-            "required": False,
-        },
-    ],
+    "display_name": "EWF Validator",
+    "description": "Validates EWF evidence sets using libewf.",
+    "task_config": [],
 }
 
 log_root = Logger()
@@ -39,64 +29,119 @@ def on_task_prerun(sender, task_id, task, args, kwargs, **_):
     log_root.bind(
         task_id=task_id,
         task_name=task.name,
-        worker_name=TASK_METADATA.get("display_name"),
+        worker_name=TASK_METADATA["display_name"],
     )
 
 
 @celery.task(bind=True, name=TASK_NAME, metadata=TASK_METADATA)
 def command(
     self,
-    pipe_result: str = None,
-    input_files: list = None,
-    output_path: str = None,
-    workflow_id: str = None,
-    task_config: dict = None,
-) -> str:
-    """Run <REPLACE_WITH_COMMAND> on input files.
-
-    Args:
-        pipe_result: Base64-encoded result from the previous Celery task, if any.
-        input_files: List of input file dictionaries (unused if pipe_result exists).
-        output_path: Path to the output directory.
-        workflow_id: ID of the workflow.
-        task_config: User configuration for the task.
-
-    Returns:
-        Base64-encoded dictionary containing task results.
-    """
-    # Setup logger
+    pipe_result=None,
+    input_files=None,
+    output_path=None,
+    workflow_id=None,
+    task_config=None,
+):
     log_root.bind(workflow_id=workflow_id)
-    logger.info(f"Starting {TASK_NAME} for workflow {workflow_id}")
 
-    input_files = get_input_files(pipe_result, input_files or [])
-    output_files = []
-    base_command = ["<REPLACE_WITH_COMMAND>"]
-    base_command_string = " ".join(base_command)
+    files = get_input_files(pipe_result, input_files or [])
 
-    for input_file in input_files:
+    if not files:
+        raise ValueError("No input files supplied")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        staged = []
+
+        for f in files:
+            name = f["display_name"]
+            source = f["path"]
+            target = Path(tmpdir) / name
+
+            os.symlink(source, target)
+            staged.append(target)
+
+        staged = sorted(staged, key=lambda p: p.name)
+
+        e01 = next(
+            (p for p in staged if p.suffix.upper() == ".E01"),
+            None,
+        )
+
+        if not e01:
+            raise ValueError("No .E01 segment supplied")
+
+        logger.info(
+            f"Validating EWF set starting with {e01.name}"
+        )
+
+        info = subprocess.run(
+            ["ewfinfo", str(e01)],
+            capture_output=True,
+            text=True,
+        )
+
+        verify = subprocess.run(
+            ["ewfverify", "-q", str(e01)],
+            capture_output=True,
+            text=True,
+        )
+
+        version = subprocess.run(
+            ["ewfverify", "-V"],
+            capture_output=True,
+            text=True,
+        )
+
+        verification_status = (
+            "PASS" if verify.returncode == 0 else "FAIL"
+        )
+
+        report = {
+            "workflow_id": workflow_id,
+            "segments": [p.name for p in staged],
+            "tool": "libewf",
+            "tool_version": (
+                version.stdout.strip()
+                or version.stderr.strip()
+            ),
+            "ewfinfo_return_code": info.returncode,
+            "ewfverify_return_code": verify.returncode,
+            "verification_status": verification_status,
+            "ewfinfo_stdout": info.stdout,
+            "ewfinfo_stderr": info.stderr,
+            "ewfverify_stdout": verify.stdout,
+            "ewfverify_stderr": verify.stderr,
+        }
+
         output_file = create_output_file(
             output_path,
-            display_name=input_file.get("display_name"),
-            extension="<REPLACE_WITH_FILE_EXTENSION>",
-            data_type="<[OPTIONAL]_REPLACE_WITH_DATA_TYPE>",
+            display_name="ewf-validation-report",
+            extension="json",
+            data_type="application/json",
         )
-        command = base_command + [input_file.get("path")]
 
-        # Run the command
-        with open(output_file.path, "w") as fh:
-            process = subprocess.Popen(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-            logger.info(process.stdout.read())
-        if process.stderr:
-            logger.error(process.stderr.read())
+        output_path_obj = Path(output_file.path)
 
-        output_files.append(output_file.to_dict())
+        output_path_obj.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-    logger.info(f"Finished {TASK_NAME} for workflow {workflow_id}")
+        output_path_obj.write_text(
+            json.dumps(report, indent=2),
+            encoding="utf-8",
+        )
+
+        logger.info(
+            f"EWF verification completed: {verification_status}"
+        )
 
     return create_task_result(
-        output_files=output_files,
+        output_files=[output_file.to_dict()],
         workflow_id=workflow_id,
-        command=base_command_string,
-        meta={},
+        command="ewfinfo + ewfverify",
+        meta={
+            "verification_status": verification_status,
+            "segments": [p.name for p in staged],
+        },
     )
